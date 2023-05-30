@@ -159,8 +159,8 @@ async fn message_handler(
             }
             //其他信息 返回发送的消息
             Err(_) => {
-                let message = format!("you send message is {:?}", text);
-                bot.send_message(msg.chat.id, message).await?;
+                let _message = format!("you send message is {:?}", text);
+                //bot.send_message(msg.chat.id, message).await?;
             }
         }
     }
@@ -203,10 +203,14 @@ async fn chat_member(
     if group.is_err() {
         add_group_user(Group::new(&username, &user_id.0.to_string(), &group_id, 0)).await?;
     }
+    println!("{:?}",chat_member.new_chat_member);
     //如果old 是left，则是加入，如果old是Member是退出
     match chat_member.new_chat_member.kind {
         teloxide::types::ChatMemberKind::Member => {
             //给用户禁用发现权限，并且发送一个用户验证消息。
+            if group.unwrap().get_status() == 1{
+                return Ok(());
+            }
             //@用户并且发送消息
             if chat_member.from.is_bot == false {
                 //生成计算公式，并计算出答案
@@ -237,7 +241,7 @@ async fn chat_member(
 async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(version) = q.data {
         //告诉telegram我们已经看到这个查询，以删除🕑 的图标
-        //客户。您也可以使用`answer_callback_query`的可选项
+        //客户。您也可以使用`answer_callback_query`的可选
         //参数来调整客户端上发生的事情。
         bot.answer_callback_query(q.id).await?;
         let permissions = ChatPermissions::all();
@@ -246,6 +250,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
             Some(msg) => {
                 let username = q.from.username.unwrap();
                 let text = format!("欢迎 @{} 加入群组！！！",username);
+                println!("{}",text);
                 let group_id = match msg.chat.kind.clone() {
                     ChatKind::Public(p) => match p.kind {
                         PublicChatKind::Supergroup(sgr) => sgr.username.unwrap(),
@@ -255,9 +260,10 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
                 };
                 let u = select_group_user(&group_id, &q.from.id.0.to_string()).await?;
                 if u.get_join_count().to_string().eq(&version) {
+                    update_group_user_status(1, &group_id, &q.from.id.0.to_string()).await?;
                     bot.restrict_chat_member(msg.chat.id, q.from.id, permissions)
                         .await?;
-                    bot.edit_message_text(msg.chat.id, msg.id, text).await?;
+                    bot.edit_message_text(msg.chat.id, msg.id, &text).await?;
                 } else {
                     bot.ban_chat_member(msg.chat.id, q.from.id).await?;
                     println!("{}-{}-{}:踢出群组",group_id,q.from.id.0,msg.id);
