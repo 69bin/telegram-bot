@@ -1,19 +1,24 @@
-use chrono::{DateTime, Utc};
 use once_cell::sync::OnceCell;
 use sqlx::MySqlPool;
-use std::error::Error;
+use toml::Table;
+use std::{error::Error, fs::File};
 use teloxide::{
     payloads::SendMessageSetters,
     prelude::*,
     types::{
-        InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputMessageContent,
-        InputMessageContentText, Me, ChatKind, PublicChatKind,ChatPermissions,
+        ChatKind, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup,
+        InlineQueryResultArticle, InputMessageContent, InputMessageContentText, Me, PublicChatKind,
     },
     utils::command::BotCommands,
 };
-
+use std::io::prelude::*;
 pub mod service;
-use service::{add_group_user, Group};
+use service::{
+    add_group_user, generate_10_num, generate_num, update_group_user_join_count,
+    update_group_user_status, Group,
+};
+
+use crate::service::select_group_user;
 
 static MYSQLPOOL: OnceCell<MySqlPool> = OnceCell::new();
 
@@ -37,10 +42,24 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
+    let mut file = match File::open("config.toml") {
+        Ok(content) => {
+            content
+        }
+        Err(_err) => {
+            panic!("配置文件打开错误，请检查配置文件。");
+        }
+    };
+    let mut config_str = String::new();
+    let _: usize = match file.read_to_string(&mut config_str){
+        Ok(text) => text,
+        Err(_err) => panic!("配置文件读取错误。")
+    };
+    let con = config_str.parse::<Table>().expect("配置文件错误，请检查。");
 
     //连接mysql数据库
     log::info!("Start connecting to database");
-    let mysql_pool = MySqlPool::connect("mysql://root:123456@127.0.0.1:3306/telegram_bot_db").await;
+    let mysql_pool = MySqlPool::connect(con["mysql_url"].as_str().unwrap()).await;
     match mysql_pool {
         Ok(pool) => {
             //把连接的数据库增加到全局变量
@@ -90,11 +109,16 @@ fn make_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(keyboard)
 }
 
-fn calculate() -> InlineKeyboardMarkup {
+fn calculate(num: i32) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = vec![];
 
+    let number = generate_10_num(num);
+
     let debian_versions = [
-        "10", "6", "9", "16", 
+        &number.0.to_string(),
+        &number.1.to_string(),
+        &number.2.to_string(),
+        &number.3.to_string(),
     ];
 
     for versions in debian_versions.chunks(4) {
@@ -165,38 +189,41 @@ async fn chat_member(
     bot: Bot,
     chat_member: ChatMemberUpdated,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let username = chat_member.chat.username().unwrap();
+    let username = chat_member.from.username.unwrap();
     let user_id = chat_member.from.id;
+    let group_id = match chat_member.chat.kind.clone() {
+        ChatKind::Public(p) => match p.kind {
+            PublicChatKind::Supergroup(sgr) => sgr.username.unwrap(),
+            _ => "".to_string(),
+        },
+        _ => "".to_string(),
+    };
+    //判断数据库是否已经存在该用户
+    let group = select_group_user(&group_id, &user_id.0.to_string()).await;
+    if group.is_err() {
+        add_group_user(Group::new(&username, &user_id.0.to_string(), &group_id, 0)).await?;
+    }
     //如果old 是left，则是加入，如果old是Member是退出
     match chat_member.new_chat_member.kind {
         teloxide::types::ChatMemberKind::Member => {
-            println!("有新用户加入，输出欢迎词！");
-            let group_id = match chat_member.chat.kind.clone() {
-                ChatKind::Public(p) => {
-                    match p.kind {
-                        PublicChatKind::Supergroup(sgr) => {
-                            sgr.username.unwrap()
-                        }
-                        _ => {
-                            "".to_string()
-                        }
-                    }
-                }
-                _ => {
-                    "".to_string()
-                }
-            };
-            add_group_user(Group::new(username, &user_id.0.to_string(), &group_id, 0)).await?;
             //给用户禁用发现权限，并且发送一个用户验证消息。
-            //禁用消息
-            let time = "2023-5-30T21:00:09+09:00".parse::<DateTime<Utc>>().unwrap();
-            //直接封禁用户
-            bot.kick_chat_member(chat_member.chat.id, user_id).until_date(time).await?;
-            bot.send_message(
-                chat_member.chat.id,
-                "请选择正确答案：8 + 8 = ?"
-            ).reply_markup(calculate())
-            .await?;
+            //@用户并且发送消息
+            if chat_member.from.is_bot == false {
+                //生成计算公式，并计算出答案
+                let nums = generate_num();
+                let text = format!("@{} 计算:{} + {} = ", username, nums.0, nums.1);
+                update_group_user_join_count(nums.2, &group_id, &user_id.0.to_string()).await?;
+                bot.send_message(chat_member.chat.id, text)
+                    .reply_markup(calculate(nums.2))
+                    .await?;
+                let permissions = ChatPermissions::empty();
+                bot.restrict_chat_member(chat_member.chat.id, user_id, permissions)
+                    .await?;
+            }
+        }
+        teloxide::types::ChatMemberKind::Left => {
+            //退出的话，把状态更改为2
+            update_group_user_status(2, &group_id, &user_id.0.to_string()).await?;
         }
         _ => {}
     }
@@ -209,19 +236,42 @@ async fn chat_member(
 ///任何人都可以读取存储在回调按钮中的数据。
 async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(version) = q.data {
-        let text = format!("You chose: {version}");
-
         //告诉telegram我们已经看到这个查询，以删除🕑 的图标
         //客户。您也可以使用`answer_callback_query`的可选项
         //参数来调整客户端上发生的事情。
         bot.answer_callback_query(q.id).await?;
-        
+        let permissions = ChatPermissions::all();
+        let message = q.message;
+        match message {
+            Some(msg) => {
+                let username = q.from.username.unwrap();
+                let text = format!("欢迎 @{} 加入群组！！！",username);
+                let group_id = match msg.chat.kind.clone() {
+                    ChatKind::Public(p) => match p.kind {
+                        PublicChatKind::Supergroup(sgr) => sgr.username.unwrap(),
+                        _ => "".to_string(),
+                    },
+                    _ => "".to_string(),
+                };
+                let u = select_group_user(&group_id, &q.from.id.0.to_string()).await?;
+                if u.get_join_count().to_string().eq(&version) {
+                    bot.restrict_chat_member(msg.chat.id, q.from.id, permissions)
+                        .await?;
+                    bot.edit_message_text(msg.chat.id, msg.id, text).await?;
+                } else {
+                    bot.ban_chat_member(msg.chat.id, q.from.id).await?;
+                    println!("{}-{}-{}:踢出群组",group_id,q.from.id.0,msg.id);
+                }
+            }
+            None => {}
+        }
+
         //编辑按钮所附邮件的文本
-        if let Some(Message { id, chat, .. }) = q.message {
+        /*if let Some(Message { id, chat, .. }) = q.message {
             bot.edit_message_text(chat.id, id, text).await?;
         } else if let Some(id) = q.inline_message_id {
             bot.edit_message_text_inline(id, text).await?;
-        }
+        }*/
         log::info!("You chose: {}", version);
     }
 
